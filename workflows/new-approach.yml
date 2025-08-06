@@ -1,0 +1,101 @@
+name: Manual Terraform Plan Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      action-apply:
+        description: "Apply if true, Plan default"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  terraform:
+    runs-on: self-hosted   # use your local runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Run Terraform Plan
+        run: terraform plan -no-color > plan.txt
+
+      - name: Ensure jq is installed
+        run: |
+          if ! command -v jq &> /dev/null; then
+            echo "jq not found, installing..."
+            if [ "$(uname)" == "Darwin" ]; then
+              brew install jq
+            else
+              sudo apt-get update && sudo apt-get install -y jq
+            fi
+          fi
+
+      - name: Prepare Trimmed Plan
+        run: |
+          # Trim to first 300 lines for safety
+          head -n 300 plan.txt > plan_trimmed.txt
+
+      - name: Generate AI Review
+        run: |
+          # Build safe JSON payload using jq
+          jq -n \
+            --arg model "gpt-4o-mini" \
+            --arg system "You are a Terraform plan reviewer. Summarize infrastructure changes clearly. Group them as Adds, Changes, or Destroys, and note risks/costs." \
+            --arg plan "Here is the Terraform plan:\n$(cat plan_trimmed.txt)" \
+            '{
+              model: $model,
+              messages: [
+                {role: "system", content: $system},
+                {role: "user", content: $plan}
+              ]
+            }' > payload.json
+
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @payload.json)
+
+          BODY=$(echo "$RESPONSE" | sed -e '/HTTP_STATUS:/d')
+          STATUS=$(echo "$RESPONSE" | grep HTTP_STATUS | cut -d: -f2)
+
+          echo "HTTP Status: $STATUS"
+          echo "Raw API Response: $BODY"
+
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ OpenAI API call failed. Writing error to summary.txt"
+            echo "$BODY" > summary.txt
+          else
+            PARSED=$(echo "$BODY" | jq -r '.choices[0].message.content' 2>/dev/null)
+            if [ -z "$PARSED" ] || [ "$PARSED" == "null" ]; then
+              echo "⚠️ Could not parse AI response. Writing raw body instead."
+              echo "$BODY" > summary.txt
+            else
+              echo "$PARSED" > summary.txt
+            fi
+          fi
+
+      - name: Show Plan & AI Review in Job Summary
+        run: |
+          echo "## Terraform Raw Plan (Trimmed)" >> $GITHUB_STEP_SUMMARY
+          echo '```hcl' >> $GITHUB_STEP_SUMMARY
+          cat plan_trimmed.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## AI Review (Human Readable)" >> $GITHUB_STEP_SUMMARY
+          cat summary.txt >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Plan & Review as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-review
+          path: |
+            plan.txt
+            plan_trimmed.txt
+            summary.txt
