@@ -1,4 +1,4 @@
-name: Ensure README.md Exists and Has Content
+name: Ensure README.md Exists and Has Content---
 
 on:
   workflow_dispatch:
